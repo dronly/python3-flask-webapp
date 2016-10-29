@@ -4,22 +4,30 @@
 __autor__ = 'Dronly'
 
 import asyncio
-import logging
 import aiomysql
+import sys
+import logging; logging.basicConfig(level=logging.INFO)
+from logging import log
+
+def create_args_string(num):
+    L=[]
+    for n in range(num):
+        L.append('?')
+    return ', '.join(L)
 
 # 创建连接池， 由__pool储存连接， 避免频繁打开和关闭数据库链接， 自动提交事务
 @asyncio.coroutine
 def create_pool(loop, **kw):
-    logging.info('create database connection pool...')
+    logging.info('creat database connection pool...')
     global __pool
     __pool = yield from aiomysql.create_pool(
-        host=kw.get('host', 'localhost'),
+        host=kw.get('host', '127.0.0.1'),
         port=kw.get('port', 3306),
         user=kw['user'],
         password=kw['password'],
         db=kw['db'],
-        charset=kw.get('charset', 'utf-8'),
-        autocommit=kw.get('autocommit', True),
+        charset=kw.get('charset', 'utf8'),
+        #autocommit=kw.get('autocommit', True),
         maxsize=kw.get('maxsize', 10),
         minsize=kw.get('minsize', 1),
         loop=loop
@@ -34,8 +42,8 @@ def destory_pool():
 
 
 @asyncio.coroutine
-def select(sql, args, size=None):
-    log(sql, args)
+def select(sql, args=None, size=None):
+    #log(sql, args)
     global __pool
     with (yield from __pool) as conn:
         cur = yield from conn.cursor(aiomysql.DictCursor)
@@ -46,26 +54,26 @@ def select(sql, args, size=None):
             rs = yield from cur.fetchall()
         yield from cur.close()
         logging.info('rows returned: %s' % len(rs))
+        conn.close()
         return rs
 
 # insert update delete 使用通用execute()函数   三种方法参数相同
-def exectue(sql, args):
-    log(sql)
+@asyncio.coroutine
+def execute(sql, args):
+    #log(sql)
+    global __pool
     with (yield from __pool) as conn:
         try:
             cur = yield from conn.cursor()
-            yield from cur.exectue(sql.replace('?', '%s'), args)
+            yield from cur.execute(sql.replace('?', '%s'), args)
+            yield from conn.commit()
             affected = cur.rowcount
             yield from cur.close()
         except BaseException as e:
-            raise
+            raise RuntimeError(r"MYSQL have same date %s" % args)
+        conn.close()
         return affected
 
-def create_args_string(num):
-    L=[]
-    for n in range(num):
-        L.append('?')
-    return ','.join(L)
 
 class Field(object):
     def __init__(self, name, column_type, primary_key, default):
@@ -88,14 +96,13 @@ class IntegerField(Field):
 
 
 class ModelMetaclass(type):
-
     def __new__(cls, name, bases, attrs):
         # 排除Model类本身：
         if name == 'Model':
             return type.__new__(cls, name, bases, attrs)
 
         tableName = attrs.get('__table__', None) or name
-        logging.info('found model: %s (table: %s)' % (name, tableName))
+        logging.info('found model: %s (tables: %s)' % (name, tableName))
 
         mappings = dict()
         fields = []
@@ -114,20 +121,25 @@ class ModelMetaclass(type):
             raise RuntimeError('primary key not found.')
         for k in mappings.keys():
             attrs.pop(k)
-        escaped_fields = list(map(lambda f: '`%s`' % f, fields))
-        attrs['__mappings__'] = mappings
-        attrs['__table__'] = tableName
-        attrs['__primary_key__'] = primaryKey
-        attrs['__fields__'] = fields
+        escaped_fileds = list(map(lambda f: '`%s`' % f, fields))
+        attrs['__mappings__'] = mappings #保存成员的数据类型的映射关系
+        attrs['__talbe__'] = tableName
+        attrs['__primary_key__'] = primaryKey #主键属性名
+        attrs['__fields__'] = fields #除主键以外的属性名
 
-        attrs['__select__'] = 'select `%s`, %s from `%s`' % (primaryKey, ','.join(escaped_fields), tableName)
-        attrs['__insert__'] = 'insert into `%s` (%s, `%s`) value (%s)' % (tableName, ','.join(escaped_fields), primaryKey, create_args_string(len(escaped_fields) + 1))
-        attrs['__update__'] = 'update `%s` set %s where `%s` =?' % (tableName, ','.join(map(lambda f: '`%s` =?' % (mappings.get(f).name or f), fields)), primaryKey)
-        attrs['__delete__'] = 'delete from `%s` where `%s` =?' % (tableName, primaryKey)
+        #构造默认的SELECT, INSERT, UPDATE, DELETE
+        attrs['__select__'] = 'select `%s`, %s from `%s`' % (primaryKey, \
+                                        ', '.join(escaped_fileds), tableName)
+        attrs['__insert__'] = 'insert into `%s` (%s, `%s`) values (%s)' %\
+                              (tableName, ', '.join(escaped_fileds), primaryKey, \
+                               create_args_string(len(escaped_fileds)+1))
+        attrs['__update__'] = 'update `%s` set %s where `%s`=?' % \
+                              (tableName, ', '.join(map(lambda f:'`%s`=?' % (mappings.get(f).name or f), fields)), primaryKey)
+        attrs['__delete__'] = 'delete from `%s` where `%s`=?' % (tableName, primaryKey)
         return type.__new__(cls, name, bases, attrs)
 
-class Model(dict, metaclass=ModelMetaclass):
 
+class Model(dict, metaclass=ModelMetaclass):
     def __init__(self, **kw):
         super(Model, self).__init__(**kw)
 
@@ -141,34 +153,34 @@ class Model(dict, metaclass=ModelMetaclass):
         self[key] = value
 
     def getValue(self, key):
-        return __getattr__(self, key, None)
+        return getattr(self, key, None)
 
     def getValueOrDefault(self, key):
         value = getattr(self, key, None)
         if value is None:
-            field = self.__mappings__[key]
+            field = self.__mapings__[key]
             if field.default is not None:
                 value = field.default() if callable(field.default) else field.default
                 logging.debug('using default value for %s:%s' % (key, str(value)))
                 setattr(self, key, value)
-            return value
+        return value
+
+    @asyncio.coroutine
+    def save(self):
+        args = list(map(self.getValueOrDefault, self.__fields__))
+        args.append(self.getValueOrDefault(self.__primary_key__))
+        rows = yield from execute(self.__insert__, args)
+        if rows != 1:
+            logging.warning('failed to insert record: affected rows: %s' % rows)
 
     @classmethod
     @asyncio.coroutine
     def find(cls, pk):
-        'find object by primary key.'
-        rs = yield from select('%s where `%s` =?' % (cls.__select__, cls.__primary_key__), [pk], 1)
+        'find object by primary key'
+        rs = yield from select('%s where `%s`=?' % (cls.__select__, cls.__primary_key__), [pk], 1)
         if len(rs) == 0:
             return None
         return cls(**rs[0])
-
-    @asyncio.coroutine
-    def save(self):
-        args = list(map(self.getValueOrDefault, sef.fields__))
-        args.append(self.getValueOrDefault(self.__primary_key__))
-        rows = yield from execute(self.__init__, args)
-        if rows != 1:
-            logging.warn('failed to insert record: arrected rows: %s' % rows)
 
     @classmethod
     @asyncio.coroutine
@@ -178,24 +190,24 @@ class Model(dict, metaclass=ModelMetaclass):
             rs = yield from select(cls.__select__, None)
         else:
             args=[]
-            value=[]
+            values=[]
             for k, v in kw.items():
-                args.append('%s=?' % k)
+                args.append('%s=?' % k )
                 values.append(v)
-        rs = yield from select('%s where %s' % (cls.select__, 'and'.join(args)), value)
+            rs = yield from select('%s where %s' % (cls.__select__,  ' and '.join(args)), values)
         return rs
 
     @classmethod
     @asyncio.coroutine
     def update(cls, **kw):
-        rs = []
+        ret = 0
         args = []
         values = []
         primary = kw.get(cls.__primary_key__)
         kw.pop(cls.__primary_key__)
         print(122, kw)
         for k, v in kw.items():
-            value.append(v)
+            values.append(v)
         values.append(primary)
         print('update', cls.__update__, kw.get(cls.__primary_key__))
         ret = yield from execute('%s' % (cls.__update__), values)
@@ -209,24 +221,50 @@ class Model(dict, metaclass=ModelMetaclass):
         return ret
 
 class User(Model):
-    __table__ = 'usres'
+    __table__ = 'user'
 
     id = IntegerField(primary_key = True)
     name = StringField()
 
     def show(self):
         print(1, '__mappings__:', self.__mappings__)
+        print(2, '__table__:', self.__table__)
+        print(3, '__primary_key__:', self.__primary_key__)
+        print(4, '__fields__:', self.__fields__)
+        print(5, '__select__:', self.__select__)
+        print(6, '__insert__:', self.__insert__)
+        print(7, '__update__:', self.__update__)
+        print(8, '__delete__:', self.__delete__)
 
+"""
+user = User(id=123, name='Michael', job='engneer')
+print('-------create finish-----------')
+user.show()
+print(9, user)
+"""
 
 loop = asyncio.get_event_loop()
 
 @asyncio.coroutine
 def test():
-    yield from create_pool(loop=loop, host='localhost', port=3306, user='root', password='123456', db='test')
+    yield from create_pool(loop=loop,host='localhost', port=3306, user='root', password='123456', db='test')
+    #user = User(id=10, name='Ablin')
+    #yield from user.save()
+    #r = yield from User.find('10')
+    #print(r)
     r = yield from User.findAll()
+    print(1, r)
+    r = yield from User.findAll(id='12')
+    print(2, r)
+    r = yield from User.findAll(name='Ablin', id='10')
+    print(3, r)
 
+    #r = yield from User.update(name='Abl2n', id='10')
+    r = yield from User.remove(id='10')
+
+    yield from destory_pool()
 
 loop.run_until_complete(test())
 loop.close()
-#if loop.is_closed():
-    #sys.exit(0)
+if loop.is_closed():
+    sys.exit(0)
